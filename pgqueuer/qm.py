@@ -16,6 +16,7 @@ from typing import (
     cast,
     overload,
 )
+import sys
 
 import anyio
 import anyio.to_thread
@@ -25,7 +26,7 @@ from .db import Driver
 from .helpers import perf_counter_dt
 from .listeners import initialize_notice_event_listener
 from .logconfig import logger
-from .models import Context, Job, JobId, PGChannel
+from .models import Context, EntrypointStatistics, Job, JobId, PGChannel
 from .queries import DBSettings, Queries
 from .tm import TaskManager
 
@@ -105,7 +106,7 @@ class QueueManager:
         default_factory=dict,
     )
     # dict[entrypoint, [count, timestamp]]
-    statistics: dict[str, deque[tuple[int, datetime]]] = dataclasses.field(
+    statistics: dict[str, EntrypointStatistics] = dataclasses.field(
         init=False,
         default_factory=dict,
     )
@@ -137,6 +138,7 @@ class QueueManager:
         self,
         name: str,
         requests_per_second: float = float("inf"),
+        concurrency_limit: int | None = None,
     ) -> Callable[[T], T]:
         """
         Registers a function as an entrypoint for handling specific
@@ -154,7 +156,12 @@ class QueueManager:
                 func=func,
                 requests_per_second=requests_per_second,
             )
-            self.statistics[name] = deque(maxlen=1_000)
+            self.statistics[name] = EntrypointStatistics(
+                samples=deque(maxlen=1_000),
+                concurrent_jobs_limiter=asyncio.Semaphore(
+                    concurrency_limit if concurrency_limit is not None else sys.maxsize
+                ),
+            )
             return func
 
         return register
@@ -164,18 +171,19 @@ class QueueManager:
         entrypoint: str,
         epsilon: timedelta = timedelta(milliseconds=0.01),
     ) -> float:
-        samples = self.statistics[entrypoint]
+        samples = self.statistics[entrypoint].samples
         if not samples:
             return 0.0
         timespan = perf_counter_dt() - min(t for _, t in samples) + epsilon
         requests = sum(c for c, _ in samples)
         return requests / timespan.total_seconds()
 
-    def entrypoints_below_requests_per_second(self) -> set[str]:
+    def entrypoints_below_capacity_limits(self) -> set[str]:
         return {
             entrypoint
             for entrypoint, fn in self.registry.items()
             if self.observed_requests_per_second(entrypoint) < fn.requests_per_second
+            and not self.statistics[entrypoint].concurrent_jobs_limiter.locked()
         }
 
     async def run(
@@ -226,7 +234,7 @@ class QueueManager:
             while self.alive:
                 jobs = await self.queries.dequeue(
                     batch_size=batch_size,
-                    entrypoints=self.entrypoints_below_requests_per_second(),
+                    entrypoints=self.entrypoints_below_capacity_limits(),
                     retry_timer=retry_timer,
                 )
 
@@ -280,7 +288,9 @@ class QueueManager:
             job.id,
         )
 
+        sem = self.statistics[job.entrypoint].concurrent_jobs_limiter
         try:
+            await sem.acquire()
             await self.registry[job.entrypoint](job)
         except Exception:
             logger.exception(
@@ -297,4 +307,5 @@ class QueueManager:
             )
             await self.buffer.add_job(job, "successful")
         finally:
+            sem.release()
             self.job_context.pop(job.id, None)
